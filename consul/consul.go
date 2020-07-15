@@ -10,7 +10,6 @@ import (
 
 	"github.com/gliderlabs/registrator/bridge"
 	consulapi "github.com/hashicorp/consul/api"
-	"github.com/hashicorp/go-cleanhttp"
 )
 
 const DefaultInterval = "10s"
@@ -58,11 +57,16 @@ func (f *Factory) New(uri *url.URL) bridge.RegistryAdapter {
 	if err != nil {
 		log.Fatal("consul: ", uri.Scheme)
 	}
-	return &ConsulAdapter{client: client}
+	lock, err := client.LockKey("lock/adapter/distributedservices")
+	if err != nil {
+		log.Fatal("Failed to create LockKey: ", uri.Scheme)
+	}
+	return &ConsulAdapter{client: client, distributedlock: lock}
 }
 
 type ConsulAdapter struct {
-	client *consulapi.Client
+	client          *consulapi.Client
+	distributedlock *consulapi.Lock
 }
 
 // Ping will try to connect to consul by attempting to retrieve the current leader.
@@ -86,6 +90,7 @@ func (r *ConsulAdapter) Register(service *bridge.Service) error {
 	registration.Address = service.IP
 	registration.Check = r.buildCheck(service)
 	registration.Meta = service.Attrs
+	r.PostAttributes(service)
 	return r.client.Agent().ServiceRegister(registration)
 }
 
@@ -148,8 +153,33 @@ func (r *ConsulAdapter) buildCheck(service *bridge.Service) *consulapi.AgentServ
 	return check
 }
 
+func (r *ConsulAdapter) PostAttributes(service *bridge.Service) error {
+	for k, v := range service.Attrs {
+		data := new(consulapi.KVPair)
+		data.Key = buildServiceKey(service, k)
+		data.Value = []byte(v)
+		log.Println("Updating Consul KV: ", data.Key, v)
+		_, err := r.client.KV().Put(data, nil)
+		if err != nil {
+			log.Println("Error Updating Attribute: ", err)
+		}
+	}
+	return nil
+}
+
+func buildServiceKey(service *bridge.Service, key string) string {
+	return fmt.Sprintf("service/%s/meta/%s", service.Name, key)
+}
+
 func (r *ConsulAdapter) Deregister(service *bridge.Service) error {
 	return r.client.Agent().ServiceDeregister(service.ID)
+}
+
+func (r *ConsulAdapter) RemoveAttributes(service *bridge.Service) error {
+	for k, _ := range service.Attrs {
+		r.client.KV().Delete(buildServiceKey(service, k), nil)
+	}
+	return nil
 }
 
 func (r *ConsulAdapter) Refresh(service *bridge.Service) error {
@@ -175,4 +205,29 @@ func (r *ConsulAdapter) Services() ([]*bridge.Service, error) {
 		i++
 	}
 	return out, nil
+}
+
+func (r *ConsulAdapter) AcquireDistributedLock() error {
+	_, err := r.distributedlock.Lock(nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *ConsulAdapter) ReleaseDistributedLock() error {
+	err := r.distributedlock.Unlock()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+//This method queries for all distributed services, not just those managed locally
+func (r *ConsulAdapter) DistributedServices() (map[string][]string, error) {
+	services, _, err := r.client.Catalog().Services(&consulapi.QueryOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return services, nil
 }
